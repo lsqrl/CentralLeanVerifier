@@ -1,2 +1,6 @@
+.lsp/
+.env
 .venv/
 __pycache__/
+_e2e_*/
+.chains/

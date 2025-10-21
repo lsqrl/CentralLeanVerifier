@@ -1,18 +1,49 @@
 # app.py
 # FastAPI + single warm Lean worker (stdio/LSP). Run with: uvicorn app:app --port 8080
-import json, os, queue, subprocess, threading, time, uuid
+import json, os, queue, subprocess, threading, time, uuid, logging, re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# ------------------ Logging setup ------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+log = logging.getLogger("lean.app")
+LOG_LSP = os.getenv("APP_LOG_LSP", "0") == "1"
+SAVE_LAST = os.getenv("APP_SAVE_LAST", "0") == "1"
+
+def _shorten(s: str, n: int = 200) -> str:
+    return s if len(s) <= n else s[:n] + "…"
+
+# Extract the first theorem signature: "theorem NAME : TYPE :="
+_THEOREM_RE = re.compile(
+    r"^\s*theorem\s+([^\s:]+)\s*:\s*(.+?)\s*:=",
+    re.MULTILINE | re.DOTALL,
+)
+
+def extract_first_theorem_signature(code: str) -> str | None:
+    m = _THEOREM_RE.search(code)
+    if not m:
+        return None
+    name, ty = m.group(1), m.group(2).strip()
+    # collapse whitespace on the type to keep it readable in logs
+    ty_one_line = re.sub(r"\s+", " ", ty)
+    return f"theorem {name} : {ty_one_line}"
 
 # ------------------ Lean worker (stdio JSON-RPC) ------------------
 def _write_msg(proc, obj):
     data = json.dumps(obj).encode("utf-8")
+    if LOG_LSP:
+        logging.getLogger("lean.lsp").debug("SEND %s", _shorten(json.dumps(obj)))
     proc.stdin.write(f"Content-Length: {len(data)}\r\n\r\n".encode("utf-8"))
     proc.stdin.write(data)
     proc.stdin.flush()
 
 def _reader(proc, out_q):
     # Minimal LSP frame reader
+    lsp_log = logging.getLogger("lean.lsp")
     while True:
         # headers
         headers = {}
@@ -28,7 +59,10 @@ def _reader(proc, out_q):
             continue
         body = proc.stdout.read(clen)
         try:
-            out_q.put(json.loads(body))
+            obj = json.loads(body)
+            if LOG_LSP:
+                lsp_log.debug("RECV %s", _shorten(json.dumps(obj)))
+            out_q.put(obj)
         except Exception:
             pass
 
@@ -44,6 +78,7 @@ class LeanWorker:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        log.info("Started Lean server pid=%s cwd=%s", self.proc.pid, os.path.abspath(self.cwd))
         self.out_q = queue.Queue()
         self.reader = threading.Thread(target=_reader, args=(self.proc, self.out_q), daemon=True)
         self.reader.start()
@@ -78,6 +113,7 @@ class LeanWorker:
             "capabilities": {},
         })
         self._notify("initialized", {})
+        log.info("Lean LSP initialized rootUri=%s", self.root_uri)
 
     def check_code(self, code: str, module_name: str = None, timeout_s: float = 8.0):
         """
@@ -146,6 +182,7 @@ class LeanWorker:
             self.proc.wait(timeout=2)
         except Exception:
             self.proc.kill()
+        log.info("Lean server stopped")
 
 # ------------------ FastAPI wiring ------------------
 app = FastAPI()
@@ -165,6 +202,7 @@ def _startup():
     os.makedirs(".lsp", exist_ok=True)
     # If your project needs Mathlib/deps, point cwd to the project root
     worker = LeanWorker(cwd=".")  # change to your lean project root if needed
+    log.info("App startup complete (SAVE_LAST=%s, LOG_LSP=%s)", SAVE_LAST, LOG_LSP)
 
 @app.on_event("shutdown")
 def _shutdown():
@@ -175,13 +213,39 @@ def _shutdown():
 def verify(req: VerifyReq):
     if not req.code or len(req.code) > 2_000_000:
         raise HTTPException(400, "code is missing or too large")
+
+    # Extract a readable statement and context for logging
+    theorem_sig = extract_first_theorem_signature(req.code) or "<no theorem found>"
+    lines = req.code.count("\n") + 1
+    chars = len(req.code)
+    mod = req.moduleName or "<auto>"
+
+    if SAVE_LAST:
+        try:
+            with open(".lsp/_last_verified.lean", "w", encoding="utf-8") as f:
+                f.write(req.code)
+        except Exception as e:
+            log.warning("Failed to save last verified code: %s", e)
+
+    log.info("VERIFY start module=%s lines=%d chars=%d theorem=%s",
+             mod, lines, chars, _shorten(theorem_sig, 240))
+
+    t0 = time.time()
     try:
         diags = worker.check_code(req.code, module_name=req.moduleName, timeout_s=10.0)
     except TimeoutError:
+        log.error("VERIFY timeout module=%s theorem=%s", mod, _shorten(theorem_sig, 240))
         raise HTTPException(504, "verification timed out")
     except Exception as e:
+        log.exception("VERIFY internal error module=%s theorem=%s", mod, _shorten(theorem_sig, 240))
         raise HTTPException(500, f"internal error: {e}")
+
+    dt = (time.time() - t0) * 1000.0
+    status = "ok" if not diags else "errors"
+    log.info("VERIFY done module=%s status=%s diags=%d time=%.1fms theorem=%s",
+             mod, status, len(diags), dt, _shorten(theorem_sig, 240))
+
     return {
-        "status": "ok" if not diags else "errors",
+        "status": status,
         "diagnostics": diags
     }
